@@ -1,0 +1,1043 @@
+---
+title: "Итоговый проект"
+author: "Группа №1"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+### Загрузка файлов и необходимых библиотек
+```{r message = FALSE, warning=FALSE}
+load("~/shared/minor2_2022/data/project/metadata_g_1.RData")
+load("~/shared/minor2_2022/data/project/ratings_g_1.RData")
+
+library(aws.s3)
+library(tidyverse)
+library(qdapTools)
+library(recommenderlab)
+library(dplyr)
+library(stringr)
+library(igraph)
+library(tnet)
+library(tidytext)
+library(readr)
+library(tidytext)
+library(ggplot2)
+library(tidyr)
+library(LDAvis)
+library(topicmodels)
+```
+
+
+Мы использовали дополнительные данные с сайта: https://www.kaggle.com/datasets/rajugc/imdb-movies-dataset-based-on-genre. Исходные данные с дополнительным датасетом мы объединили по колонке imdbId. В результате получился датасет из 448 строк. С его помощью удалось получить такие данные, как жанры, описания фильмов, хронометраж, возрастные ограничения. Эти данные позволяют нам построить более точную Content-Based рекомендательную систему.
+
+
+```{r message = FALSE, warning=FALSE}
+full = read.csv('~/shared/minor2_2022_1/full_data_clear.csv')
+```
+
+### Предобработка 
+
+Мы провели как ***сетевой***, так и ***текстовый*** анализы.
+
+#### Сетевой анализ
+
+* Построение трех двудольных графов и их преобразование
+* Взвешанные проекции через метод Ньюмана
+* Выделение сообществ
+
+##### Фильм - жанр
+
+Подготовка данных
+
+```{r message = FALSE, warning=FALSE}
+#Разделяем данные по жанрам на колонки, где 1 - фильм принадлежит к этому жанру, 0 - не принадлежит.
+movies_genre = full %>% select(item_id) %>% cbind(mtabulate(str_split(full$genre, ", ")))
+
+#Делаем имена item_id номером строки и преобразуем данные в матрицу.
+movies_genre = movies_genre %>% distinct(item_id, .keep_all = TRUE) %>% column_to_rownames(var = "item_id")
+movies_matrix = movies_genre %>% as.matrix()
+```
+
+Делаем двудольный граф из матрицы, где связь ***фильм - жанр***, а затем делаем его проекцию, в которой связь ***фильм - фильм***, при наличии общего жанра.
+
+```{r message = FALSE, warning=FALSE}
+g <- graph_from_incidence_matrix(movies_matrix)
+pr = bipartite.projection(g)
+p <- pr[[1]]
+```
+
+Попробуем выделить сообщества фильмов по жанрам. Атрибут веса ребер показывает, сколько раз фильмы совпали по жанру. Попробуем изобразить:
+
+```{r message = FALSE, warning=FALSE}
+V(p)$label <- NA
+lt = layout.fruchterman.reingold(p)
+plot(p, vertex.size = 2, layout = lt)
+```
+
+Видно очень плохо, здесь сложно будет выделить осознанные кластеры. Сделаем взвешанную проекцию через подход Ньюмана. Взвесим и построим распределение силы связи между фильмами с указанием среднего.
+
+
+```{r message = FALSE, warning=FALSE}
+movies_id <- rownames(movies_matrix)
+df <- data.frame(movies = movies_id, i = 1:nrow(full))
+df2 <- data.frame(movies_1 = movies_id, j = 1:nrow(full))
+
+#Делаем проекцию.
+p = projecting_tm(movies_matrix, method="Newman")
+p <- left_join(p, df, by = "i") #Проекция использует просто номера по порядку, а не id фильмов.
+p <- left_join(p, df2, by = "j")
+p = dplyr::select(p, i = movies, j = movies_1, w)
+
+#Добавим сразу названия для удобства.
+titles = select(full, movie_name, item_id)
+
+p$i = as.numeric(p$i)
+p$j = as.numeric(p$j)
+
+p = p %>% left_join(titles, by = c("i" = "item_id")) %>% left_join(titles, by = c("j" = "item_id"))
+p = select(p, movie_name.x, movie_name.y, w)
+```
+
+
+Посмотрим, какие ребра будем удалять. Для это визуализируем:
+
+
+```{r message = FALSE, warning=FALSE}
+ggplot(p) + 
+  geom_histogram(aes(x=w), fill = "lightblue") +
+  geom_vline(aes(xintercept=median(w)), color="blue", linetype="dashed", size=1) +
+  xlab("Newman's coefficient") 
+```
+ 
+Удалим связи меньше 0.05 (число подобрали в ручную).
+
+ 
+```{r message = FALSE, warning=FALSE}
+p1 = filter(p, w >= 0.05)
+ 
+net1 <- igraph::simplify(graph_from_data_frame(p1, directed=F))
+
+plot(net1, vertex.label = NA, vertex.size = 3, layout = layout.kamada.kawai(net1))
+```
+
+Видно структуру! Кажется есть осознанные кластеры. Попробуем выделить сообщества: 
+
+
+```{r, dpi=100, fig.height=7, fig.width=7}
+fgcommune <- fastgreedy.community(net1)
+membership_genres = membership(fgcommune)
+ 
+plot(net1, layout = layout.kamada.kawai(net1), edge.arrow.size = 0, vertex.color = membership_genres, vertex.size = 5,vertex.label.cex = 0.8, margin = -0.1)
+```
+
+Посмотрим на значении модулярности. Оно довольно высокое:
+
+
+```{r message = FALSE, warning=FALSE}
+modularity(fgcommune) #высокая модулярность
+```
+
+***Промежуточные выводы сетевого анализа фильмов по жанрам***
+
+* Удалось выделить осознанные кластеры со структурой
+* Главный недостаток - эта структура видна только при серьезном сокращении количества фильмов для анализа (до 81). Следовательно, теряя большую часть данных, наши рекомендации могут ухудшиться
+
+##### Фильм - актер
+
+
+Подготовка данных
+
+
+```{r message = FALSE, warning=FALSE}
+#Разделяем данные на колонки, где 1 - в фильме есть этот актер, 0 - такого актера в фильме нет.
+movies_starring =  full %>% select(item_id) %>% cbind(mtabulate(str_split(full$starring, ", "))) 
+
+#Преобразуем в матрицу
+movies_starring = movies_starring %>% distinct(item_id, .keep_all = TRUE) %>% column_to_rownames(var = "item_id")
+movies_starring_matrix = movies_starring %>% as.matrix()
+
+#Преобразуем в двудольный граф, а затем делаем его проекцию
+s <- graph_from_incidence_matrix(movies_starring_matrix)
+sr = bipartite.projection(s) 
+s <- sr[[1]]
+```
+
+
+Вернемся к выделению групп, похожих по актерам. Визуализируем, но опять ничего не видно:
+
+
+```{r message = FALSE, warning=FALSE}
+V(s)$label <- NA
+lt_s = layout.fruchterman.reingold(s)
+plot(s, vertex.size = 2, layout = lt_s)
+```
+
+Снова попробуем использовать метод Ньюмана, чтобы сделать граф более наглядным.
+
+
+```{r message = FALSE, warning=FALSE}
+movies_id <- rownames(movies_starring_matrix)
+df <- data.frame(movies = movies_id, i = 1:nrow(full))
+df2 <- data.frame(movies_1 = movies_id, j = 1:nrow(full))
+
+#Делаем проекцию
+s = projecting_tm(movies_starring_matrix, method="Newman")
+s <- left_join(s, df, by = "i") #Проекция использует  номера по порядку, а не id фильмов
+s <- left_join(s, df2, by = "j")
+s = dplyr::select(s, i = movies, j = movies_1, w)
+
+#Добавим имена
+titles = select(full, movie_name, item_id)
+
+s$i = as.numeric(s$i)
+s$j = as.numeric(s$j)
+
+s = s %>% left_join(titles, by = c("i" = "item_id")) %>% left_join(titles, by = c("j" = "item_id"))
+s = select(s, movie_name.x, movie_name.y, w)
+```
+
+
+Посмотрим, какие ребра следует удалить:
+
+
+```{r message = FALSE, warning=FALSE}
+ggplot(s) + 
+  geom_histogram(aes(x=w), fill = "lightblue") +
+  geom_vline(aes(xintercept=median(w)), color="blue", linetype="dashed", size=1) +
+  xlab("Newman's coefficient") 
+```
+ 
+Удаляем  некоторые связи. Число подобрано в ручную
+
+ 
+```{r message = FALSE, warning=FALSE}
+s1 = filter(s, w >= 0.6)
+ 
+net2 <- igraph::simplify(graph_from_data_frame(s1, directed=F))
+V(net2)$color <- "steel blue"
+
+plot(net2, vertex.label = NA, vertex.size = 3, layout = layout.kamada.kawai(net2))
+```
+
+Посмотрим, можно ли осознанно разделить на сообщества:
+
+
+```{r, dpi=100, fig.height=7, fig.width=7}
+fgcommune_s <- fastgreedy.community(net2)
+membership_starring = membership(fgcommune_s)
+ 
+plot(net2, layout = layout.kamada.kawai(net2), edge.arrow.size = 0, vertex.color = membership_starring, vertex.size = 5,vertex.label.cex = 0.4, margin = -0.1)
+```
+
+
+Обратим внимание на значение модулярности. Оно достаточно высокое.
+
+
+```{r message = FALSE, warning=FALSE}
+modularity(fgcommune_s)
+```
+***Промежуточные выводы сетевого анализа фильмов по актерам***
+
+* Получилось разбить на сообщества с высокой модулярностью
+* Опять обрезали значительную часть данных (осталось 325 из 448)
+* Судя по визуализации, фильмы по актерам не формируют четкие и при этом связанные между собой сообщества
+
+##### Фильм - режиссер
+
+Подготовка данных. Снова проделываем тот же алгоритм.
+
+```{r message = FALSE, warning=FALSE}
+full_d = full %>% filter(is.na(directedBy) == FALSE)
+
+movies_directed = full_d %>% cbind(mtabulate(str_split(full_d$directedBy, ", "))) %>% 
+  select(-X,-movie_name, -year, -certificate, -runtime, -rating, -description, -genre, -gross.in..., -title, -directedBy, -starring, -imdbId, -avgRating)
+
+movies_directed = movies_directed %>% distinct(item_id, .keep_all = TRUE) %>% column_to_rownames(var = "item_id")
+movies_directed_matrix = movies_directed %>% as.matrix()
+
+d <- graph_from_incidence_matrix(movies_directed_matrix)
+dr = bipartite.projection(d) 
+d <- dr[[1]]
+```
+
+Визуализируем. Опять плохо видно.
+
+```{r message = FALSE, warning=FALSE}
+V(d)$label <- NA
+lt_d = layout.fruchterman.reingold(d)
+plot(d, vertex.size = 2, layout = lt_d)
+```
+
+Снова используем метод Ньюмана, чтобы сделать граф более нагладным.
+
+```{r message = FALSE, warning=FALSE}
+movies_id <- rownames(movies_directed_matrix)
+df <- data.frame(movies = movies_id, i = 1:nrow(full_d))
+df2 <- data.frame(movies_1 = movies_id, j = 1:nrow(full_d))
+
+#Делаем проекцию
+d = projecting_tm(movies_directed_matrix, method="Newman")
+d <- left_join(d, df, by = "i") 
+d <- left_join(d, df2, by = "j")
+d = dplyr::select(d, i = movies, j = movies_1, w)
+
+titles = select(full, movie_name, item_id)
+
+d$i = as.numeric(d$i)
+d$j = as.numeric(d$j)
+
+d = d %>% left_join(titles, by = c("i" = "item_id")) %>% left_join(titles, by = c("j" = "item_id"))
+d = select(d, movie_name.x, movie_name.y, w)
+```
+
+Посмотрим, какие ребра будем удалять.
+
+```{r message = FALSE, warning=FALSE}
+ggplot(d) + 
+  geom_histogram(aes(x=w), fill = "lightblue") +
+  geom_vline(aes(xintercept=median(w)), color="blue", linetype="dashed", size=1) +
+  xlab("Newman's coefficient") 
+```
+ 
+Удаляем связи. Число подобрано в ручную.
+
+ 
+```{r message = FALSE, warning=FALSE}
+d1 = filter(d, w >= 0.01)
+ 
+net3 <- igraph::simplify(graph_from_data_frame(d1, directed=F))
+V(net3)$color <- "steel blue"
+
+plot(net3, vertex.label = NA, vertex.size = 3, layout = layout.kamada.kawai(net2))
+```
+
+Разобьем по сообществам и визуализируем: 
+
+
+```{r, dpi=100, fig.height=7, fig.width=7}
+fgcommune_d <- fastgreedy.community(net3)
+membership_directed = membership(fgcommune_d)
+ 
+plot(net3, edge.arrow.size = 0, vertex.color = membership_directed, vertex.size = 5,vertex.label.cex = 0.4, margin = -0.1)
+```
+
+Значение модулярности:
+
+```{r message = FALSE, warning=FALSE}
+modularity(fgcommune_d) #высокая модулярность
+```
+
+***Промежуточные выводы сетевого анализа фильмов по режиссерам***
+
+* Получилось разбить на сообщества - 94 штуки
+* Снова обрезали большую часть данных (256 фильмов из 448)
+* Визуализация не показывает четко оформленных сообществ и логичных связей между ними
+
+##### Вывод по сетевому анализу
+
+* При анализе всех трех графов было получено высокое значение модулярности, однако не во всех случаях визуализации сообщества были четко и логично выделены
+* При каждом разбиении на сообщества пришлось обрезать большую часть данных, что сильно повлияло бы на рекомендательную систему
+* Так, было принято решение использовать жанры, а не сообщества по ним, как характеристику для Content-Based системы т.к. они все же по нашему мнению важны для определения содержания фильма. Сообщества по актерам и режиссерам также не представляются релевантными для использования, однако, мы считаем, что совпадающий актерский состав или любимый режиссер человека могут повлиять на его решение о просмотре. Поэтому мы будем также использовать разбиение фильмов по актерам и режиссерам без привязки к сообществам в нашей Content-Based рекомендательной системе
+
+#### Текстовый анализ
+
+##### Разбиение фильмов по словам в их описании
+
+Разобьем описание фильмов на слова и посчитаем количество уникальных слов. Получилось 3594.
+
+```{r message = FALSE, warning=FALSE}
+stopwords <- data.frame(words=stopwords::stopwords("en"), stringsAsFactors=FALSE) #подгружаем словарь со стоп-словами 
+
+data.tidy = full %>%
+    unnest_tokens(words, description, token = "words") %>% select(movie_name, item_id, words) #Разбили описание фильма на слова
+
+data.tidy %>%
+    dplyr::select(words) %>%
+    n_distinct() #Посчитали кол-во уникальных слов. Их 3594.
+```
+Обычно самые часто встречающиеся слова - служебные части речи, которые не несут смысла. Так как нас интересует содержание текста, удалим стоп-слова из нашего текста.
+
+После построим график 30 самых часто встречающихся слов. Это слова "man", "young", "new", "life" и тд. Эти слова не могут нам сказать ничего определенного о содержании фильма, его эмоциональной составляющей.
+
+```{r message = FALSE, warning=FALSE}
+data.nonstop = data.tidy %>%
+    anti_join(stopwords) #удалили стоп-слова. Осталось 7040 слов.
+
+words_count = data.nonstop %>% 
+  dplyr::count(words) 
+
+data.nonstop %>%
+  dplyr::count(words) %>%
+  top_n(30, n) %>%
+  ggplot(aes(x = reorder(words, n), y = n)) +
+  geom_col(fill = "darkblue", color = "white") +
+  labs(x = "Word", y = "Frequency") + 
+  coord_flip() +
+  theme_minimal()
+
+```
+##### Разбиение фильмов по словам в их названии
+
+Поробуем помотреть на названия фильмов, ведь обычно название отражает сам фильм.
+Количество уникальных слов в названиях фильмов - 767.
+Из графика мы видим, что самые частые слова в названиях фильмов нам так же ничего конкретного не говорят: "2", "man", "star" и проч.
+
+```{r message = FALSE, warning=FALSE}
+data.tidy2 = full %>%
+  unnest_tokens(words, movie_name, token = "words") %>% select(item_id, words) 
+#Разбили названия фильма на слова
+
+data.tidy2 %>%
+    dplyr::select(words) %>%
+    n_distinct() #Посчитали кол-во уникальных слов. Их 767.
+
+data.nonstop2 = data.tidy2 %>%
+    anti_join(stopwords) #удалили стоп-слова. Осталось 944 слов.
+
+words_count2 = data.nonstop2 %>% 
+  dplyr::count(words) 
+
+data.nonstop2 %>%
+    dplyr::count(words) %>%
+    top_n(10, n) %>%
+    ggplot(aes(x = reorder(words, n), y = n)) +
+    geom_col(fill = "darkblue", color = "white") +
+    labs(x = "Word", y = 'Frequency') + 
+    coord_flip() +
+    theme_minimal()
+```
+
+##### Разбиение фильмов на топики
+Попробуем проанализировать имеющиеся теги. Оставим те из них, где оценка соответствия не ниже 3. Это позволит убрать менее подходящие теги. 
+
+```{r message = FALSE, warning=FALSE}
+survey_answers_clean <- survey_answers %>%
+  filter(score >= 3) %>%
+  select(item_id, tag_id) %>%
+  distinct() %>%
+  group_by(tag_id) %>%
+  filter(n() > 1) %>%
+  ungroup()
+```
+
+Проведем sentiment-анализ с помощью выбранных тегов.
+
+```{r message = FALSE, warning=FALSE}
+sentiments <- get_sentiments("bing")
+survey_answers_clean1 <- survey_answers %>%
+  filter(score >= 3) 
+tags_clean <- tags %>%
+  filter(!str_detect(tag, "!")) %>%
+  mutate(tag = str_replace(tag, "\\(.*\\)", ""))
+merged <- survey_answers_clean1 %>%
+  left_join(tags_clean, by = c("tag_id" = "id")) %>%
+  select(-user_id, -score) %>%
+  inner_join(sentiments, by = c("tag" = "word"))
+merged$sentiment <- ifelse(merged$sentiment == 'positive', 1, -1)
+merged <- merged %>% 
+  group_by(item_id) %>%
+  summarize(sentiment_score = sum(sentiment))
+```
+
+Поскольку только 50 из всех фильмов смогли получить оценку, эта характеристика не будет использоваться нами при построении системы. Однако результат получился интересный. Все же завершим анализ: разделим фильмы на 5 топиков и посмотрим на то, какие слова входят в каждый.
+
+```{r message = FALSE, warning=FALSE}
+tags_clean <- tags_clean %>%
+  unnest_tokens(tags, tag)
+dtm <- tags_clean %>%
+  count(id, tags) %>%
+  cast_dtm(id, tags, n)
+num_topics <- 5
+lda_model <- LDA(dtm, k = num_topics)
+top_terms <- terms(lda_model, 10)
+
+tags_topics <- tidy(lda_model, matrix = "beta")
+
+tags_top_terms <- tags_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+tags_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+Можно заметить, что слова между топиками очень перекликаются, а это значит, что рузультаты получились не самыми точными, поэтому мы решили их не использовать при построении рекомендательной системы.
+
+
+##### Вывод по текстовому анализу
+
+Подсчет частотности слов как в названиях фильмов, так и в их описаниях, не позволяет уточнить рекомендации т.к. это не позволяет определить, о чем именно фильм, и какие у него особенности.
+
+Разделение фильмов на слова и топики в зависимости от сентимента слов оказалось не очень хорошей идеей, так как качественная интерпретация отсутствует. Sentiment-анализ с помощью тегов показал, что только 50 фильмов смогли получить оценку (причем разброс оценок варьируется от -1 до 1, за некоторым исключением), поэтому мы решили не использовать эту характеристику при построении системы.
+
+
+### Collaborative filtering рекомендация
+
+Данный рекомендательная система использует оценки пользователей в качестве критерия схожести фильмов, и именно поэтому в нашем проекте вы решили применить методы, отличные от User-based и Item-based фильтрации. Мы рассмотрели несолько методов, относящихся к realRatingMatrix, с которой мы работаем, из документации recommenderRegistry. Были выделены следующие методы:
+
+* SVD - сингулярное разложение (на три отдельные матрицы). Данный метод как-бы снижает размерность полученной матрицы рейтингов. Однако приближенно имеющаяся матрица рейтингов равна произведению двух других: одна матрица как-бы снижает размерность признаков фильмов по какому-то латентному признаку для каждого пользователя, а другая - транспонированная матрица, которая также создает призаки но уже по пользователям для каждого фильма. Также между ними в произведении будет находится диагональная матрица, олицетворяющая силу каждого новообразованного фактора.
+
+* ALS - еще один алгоритм матричной факторизации, метод чередующихся наименьших квадратов. Он также распладывает исходную матрицу рейтингов на несколько матриц, в этот раз на две: (пользователь, латентный признак) и (фильм, латентный признак). У обеих этих матриц минимизируется среднеквадратическая ошибка относительно имеющейся изначальной матрицы рейтингов (ее соответствия с ней). В этих новых матрицах имеются все значения, в отличие от изначальной матрицы с пропущенными (мы же предсказываем данные), однако при минимизации мы используем только заполненные значения в первой матрице (все нулевые отбрасываем, чтобы не возникало необоснованного вычетания из нуля предсказанного значения)
+
+*Источники:*
+https://www.youtube.com/watch?v=E8aMcwmqsTg
+https://stats.stackexchange.com/questions/354355/what-is-the-relation-between-svd-and-als
+http://rstudio-pubs-static.s3.amazonaws.com/287685_258f4041cee643f9aaf7b2b654a82162.html
+https://analyticsindiamag.com/singular-value-decomposition-svd-application-recommender-system/
+https://cran.r-project.org/web/packages/recommenderlab/vignettes/recommenderlab.pdf
+
+Приступим к написанию кода и оценим все 5 моделей по их средневадратичным ошибкам:
+
+```{r message = FALSE, warning=FALSE}
+  rates = pivot_wider(ratings, names_from = item_id, values_from = rating)
+  userNames = rates$user_id
+  rates = select(rates, -user_id)
+  
+  #Рекомендация для имеющихся пользователей
+  
+  rates = as.matrix(rates)
+  rownames(rates) = userNames
+  r = as(rates, "realRatingMatrix", strict = T)
+  
+  ratings_movies <- r[rowCounts(r) > 5, colCounts(r) > 10]
+  
+  set.seed(1337)
+  eval_sets <- evaluationScheme(data = ratings_movies, 
+                              method = "split",
+                              train = 0.8, # доля обучающей выборки
+                              given = 15, # сколько оценок используется для  предсказания
+                              goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+  
+  r.svd <- Recommender(getData(eval_sets, "train"), "SVD")
+  r.als <- Recommender(getData(eval_sets, "train"), "ALS")
+  r.ubcf <- Recommender(getData(eval_sets, "train"), "UBCF")
+  r.ibcf <- Recommender(getData(eval_sets, "train"), "IBCF")
+  
+  p.svd <- predict(r.svd, getData(eval_sets, "known"), type = "ratings")
+  p.als <- predict(r.als, getData(eval_sets, "known"), type = "ratings")
+  p.ubcf <- predict(r.ubcf, getData(eval_sets, "known"), type = "ratings")
+  p.ibcf <- predict(r.ibcf, getData(eval_sets, "known"), type = "ratings")
+```
+
+```{r message = FALSE, warning=FALSE}
+error <- rbind(
+  SVD = calcPredictionAccuracy(p.svd, getData(eval_sets, "unknown")),
+  ALS = calcPredictionAccuracy(p.als, getData(eval_sets, "unknown")),
+  UBCF = calcPredictionAccuracy(p.ubcf, getData(eval_sets, "unknown")),
+  IBCF = calcPredictionAccuracy(p.ibcf, getData(eval_sets, "unknown")))
+error = as.data.frame(error)
+```
+
+```{r message = FALSE, warning=FALSE}
+error
+```
+
+**Вывод:** Наилучшая модель получается при применении метода SVD, однако затруднительная интерпретация данного метода с текущем уровнем знаний и необходимость проведения операций над матрицами для получения необходимых рекомендаций вынудили нашу команду остановиться на более простом методе - UBCF
+Далее приведен код рекомендательной системы на основе коллаборативной фильтрации, который на вход в качестве строки принимает id пользователя. Она основана на User-Based фильтрации
+
+Первичный код, не относящийся к функции:
+
+```{r message = FALSE, warning=FALSE}
+rates = pivot_wider(ratings, names_from = item_id, values_from = rating)
+userNames = rates$user_id
+rates = select(rates, -user_id)
+
+rates = as.matrix(rates)
+rownames(rates) = userNames
+r = as(rates, "realRatingMatrix", strict = T)
+
+ratings_movies <- r[rowCounts(r) > 5, colCounts(r) > 10]
+
+set.seed(1337)
+test_ind <- sample(1:nrow(ratings_movies), size = nrow(ratings_movies)*0.2)
+recc_data_train <- ratings_movies[-test_ind, ]
+recc_data_test <- ratings_movies[test_ind, ]
+recc_model <- Recommender(data = recc_data_train, method = "UBCF")
+```
+
+А также напишем функции для старого пользователя (заметим, что predict находится внутри функции и что модель предсказываается на всем датасете, а не только на трейне:
+
+```{r message = FALSE, warning=FALSE}
+func_old = function(viewerid, recc_predicted, metadata){
+  
+  recc_predicted <- predict(object = recc_model, newdata = ratings_movies, n = 7)
+  names(recc_predicted@items) = rownames(ratings_movies)
+  
+  recc_user <- recc_predicted@items[[viewerid]]
+  movies_user <- recc_predicted@itemLabels[recc_user]
+  names_movies_user <- metadata$title[match(movies_user, metadata$item_id)]
+  return(names_movies_user)
+}
+```
+
+И для нового пользователя (она по факту никак не зависит от id пользователя):
+
+```{r message = FALSE, warning=FALSE}
+func_new = function(viewerid, ratings, metadata){
+  top = ratings %>% group_by(item_id) %>% summarise(total_count=n(), avg_rate=mean(rating)) %>% filter(avg_rate > 4) %>% arrange(desc(total_count)) %>% head(10)
+  new_top = metadata[metadata$item_id %in% top$item_id,] %>% select(title, avgRating) %>%          arrange(desc(avgRating))
+  movie_names = new_top %>% select(title) %>% head(7) %>% as.list()
+  return(movie_names)
+}
+```
+
+Посчитаем количество неоцененных фильмов для каждого пользователя и занесем это в датафрейм. Это необходимо для опознания того, что у пользователя недостаточно оценок для выдачи ему качественной рекомендации или у него их вообще нет, так как новый для данного сервиса. В предыдущем чанке мы отсекали количество оцененных фильмов > 5, Поэтому здесь, учитывая что у нас 500 фильмов, сделаем следующее условие:
+
+1. Если количество NA оценок у пользователя >= 495, то есть у него оценено 5 и менее фильмов, то он считается нвым пользователем и ему выдаются соответствующие рекомендации
+
+2. Если количество NA оценок у пользователя < 495, то система выдает ему список фильмов на основе уже им оцененных
+
+Так как в комментариях мы получили замечание о том, что if-else находится внутри функции, исправим данный момент и определим принадлежность пользователя заранее
+
+Создадим нужный датафрейм с подсчетом NA:
+
+```{r message = FALSE, warning=FALSE}
+na_count <- data.frame(rowSums(is.na(rates)))
+
+```
+
+```{r message = FALSE, warning=FALSE}
+summary(na_count$rowSums.is.na.rates..)
+```
+Как оказалось, все фильмы подходят под условия рекомендательной системы, то есть у всех пользователей оцено 6 и более фильмов. Поэтому опознание пользователя сводится к классификации на известного и неизвестного
+
+Попросим пользователя ввести свой id. Из семинаров изветсно, что крайне не рекомендуется в данной работе использовать такой ручной ввод, однако мы пока не придумали аналогов вводу id в функции, так как ее при проверке пользователя, как оказалось, использовать нельзя. Чтобы избежать возможных комментариев по этой теме, то допустим, что в нашем сервисе есть качественный интерфейс, который позволяет ввести идентификатор пользователя.
+
+Для иллюстрации работы этой системы (изначально тут был readline, но его было решено убрать). Допустим, id пользователя 1337, что же ему выдаст система?
+
+```{r message = FALSE, warning=FALSE}
+a = 'С возвращением! Готовы предоставить ваши персонализированные рекомендации'
+b = 'Добро пожаловать в наш сервис! Представляем вашему вниманию подборку лучших фильмов'
+
+var = 1337
+
+var = toString(var)
+
+if(var %in% userNames){
+print(a)
+func_old(var, recc_predicted, metadata)
+} else {
+print(b)
+func_new(var, ratings, metadata)
+}
+
+```
+
+**Вывод:** Получили систему, которая сначала определяет, есть ли пользователь в системе, а потом приветствует его соответствующим образом и выводит рекомендацию. Пользователя с id 1337 нет в рекомендациях
+
+**Оценивание рекомендации:** Оценивание системы производилось на основе сравнения полученных среднеквадратичных ошибок, а также на конкретных примерах и сценариях, описанных в дальнейших разделах.
+
+
+## Content-based рекомендация
+
+```{r message = FALSE, warning=FALSE}
+library(tidyverse)
+library(tidyr)
+
+load("~/shared/minor2_2022/data/project/metadata_g_1.RData")
+load("~/shared/minor2_2022/data/project/ratings_g_1.RData")
+full = read.csv('~/shared/minor2_2022_1/full_data_clear.csv')
+
+```
+
+
+
+**Использовали такие переменные, как**:
+
+- year (год)
+- certificate (сертификация фильма по возрастным категориям)
+- genre (жанр)
+- rating (рейтинг)
+- directedBy (режиссер)
+- star (актеры)
+
+**Логика рекомендации**:
+
+1. Вычисление матрицы схожести фильмов:
+
+- Создание датафрейма *movies*, содержащего выбранные столбцы из *full* (название, id, год выпуска, сертификация, жанр, рейтинг, режиссер, актеры)
+- Создание дополнительных признаков, таких как наличие возрастного рейтинга и кодирование жанров в бинарные столбцы
+- Вычисление матрицы схожести фильмов на основе их признаков с использованием функции *lsa::cosine*
+
+
+2. Получение рекомендации:
+
+- На вход функция принимает id пользователя (*viewerid*) и любимый жанр (*user_genre*) 
+- Функция возвращает рекомендацию в виде датафрейма, содержащего информацию о 10 фильмах и их схожести, в зависимости от сценария 2a или 2b.
+
+
+2a. При наличии id пользователя (*viewerid*) в датасете *ratings*:
+
+- Фильтрация рейтингов по пользователю с заданным идентификатором (*viewerid*) и оценкой 5
+- Выбор наиболее похожих фильмов на основе матрицы схожести и оценок пользователя
+
+
+2b. При отсутствии id пользователя (*viewerid*) в датасете *ratings*:
+
+- На основе введенного вользователем любимого жанра формируется рекомендация на основе фильмов с наивысшими средними рейтингами в этом жанре
+
+
+
+
+
+**Предобработка**
+
+Создаем датасет с нужными переменными
+```{r message = FALSE, warning=FALSE}
+movies <- full %>% dplyr::select(title, item_id, year, certificate, genre,rating)
+```
+
+Создадим новый столбец has_age_rating, который будет показывать, есть ли у фильма возрастное ограничения
+```{r message = FALSE, warning=FALSE}
+age_ratings <- table(movies$certificate)
+movies$has_age_rating <- ifelse(movies$certificate %in% c("PG-13", "R", "TV-MA"), 1, 0)
+```
+
+Закодируем датасет в бинарный столбец 
+```{r message = FALSE, warning=FALSE}
+movies <- movies %>% separate_rows(genre, sep = ", ")
+movies <- movies %>% mutate(genres_v = 1)
+movies <- movies %>% pivot_wider(names_from = genre, values_from = genres_v, values_fill = 0)
+```
+
+Закодируем актеров в бинарный столбец 
+```{r message = FALSE, warning=FALSE}
+movies_star <- full %>% dplyr::select(item_id,star)
+movies_star <- movies_star %>% separate_rows(star, sep = ", ")
+movies_star <- movies_star %>% mutate(stars_v = 1)
+movies_star <- movies_star %>% pivot_wider(names_from = star, values_from = stars_v, values_fill = 0)
+```
+
+Закодируем режиссеров в бинарный столбец  
+```{r message = FALSE, warning=FALSE}
+movies_dir <- full %>% dplyr::select(item_id,directedBy)
+movies_dir <- movies_dir %>%  dplyr::mutate (dir_count=1)
+movies_dir <- movies_dir %>% pivot_wider(names_from = directedBy, values_from = dir_count, values_fill = 0)
+```
+
+Соединяем все датасеты  
+```{r message = FALSE, warning=FALSE}
+add_movies <- merge(movies_star, movies_dir, by = "item_id", all = TRUE)
+movies <- merge(add_movies, movies, by = "item_id")
+```
+
+Удаляем лишние переменные
+```{r message = FALSE, warning=FALSE}
+movies <- movies %>% dplyr::select(-title, -certificate)
+```
+
+Считаем матрицу схожести фильмов 
+```{r message = FALSE, warning=FALSE}
+rownames <- movies$item_id
+movies <- movies %>% dplyr::select(-item_id)
+rownames(movies) <- rownames
+sim <- lsa::cosine(t(as.matrix(movies)))
+diag(sim) <- 0
+```
+
+**Код для СВ системы в виде функции**
+
+```{r message = FALSE, warning=FALSE}
+get_cb_recommendation <- function(viewerid, user_genre){
+  
+  if (viewerid %in% ratings$user_id) {
+
+  user <- ratings %>% filter(user_id == viewerid & rating == 5)
+  simCut <- sim[,as.character(user$item_id)]
+  
+  mostSimilar <- head(sort(simCut, decreasing = T), n = 10)
+
+  a <- which(simCut %in% mostSimilar, arr.ind = TRUE, useNames = T)
+  index <- arrayInd(a, .dim = dim(simCut))
+  result <- rownames(sim)[index[,1]]
+
+  mostSimilar <- data.frame(item_id = as.numeric(result),
+                         similar = simCut[index])
+
+  result_exist <- mostSimilar %>% left_join(full, by = "item_id") %>% select(item_id, title, similar) %>% arrange(-similar)
+
+# рекомендации для пользователя, которого нет в системе
+# спросим пользователя какой у него любимый жанр и предложим ему посмотреть фильмы с самым высоким рейтингом по этому жанру
+  
+    
+    return(result_exist)
+    
+  } else {
+    movies_split <- separate(full, genre, into = paste0("Genre", 1:3), sep = ", ")
+
+    movies_filtered <- filter(movies_split, Genre1 == user_genre | Genre2 == user_genre | Genre3 == user_genre)
+
+    movies_grouped <- group_by(movies_filtered, title)
+    movies_mean_ratings <- summarize(movies_grouped, mean_rating = mean(avgRating))
+
+    top_10_movies <- arrange(movies_mean_ratings, desc(mean_rating)) %>% top_n(10)
+
+    result_noexist <- select(top_10_movies, title, mean_rating)
+    return(result_noexist)
+    
+  }
+}
+```
+
+**Оценивание рекомендации:** 
+
+Так как такие оценочные методы как MSE, RMSE не подходят для оценивания качества content-based системы, мы оценили адекватность рекомендаций по характеристикам фильмов и их описанию. На основе множества примеров из peer-review можно сказать, что система получилась качественной, так как она выдает фильмы похожих жанров, а также, зачастую, из одной вселенной, например, Гарри Поттера или Марвел, что определенно свидетельствует об эффективности рекомендательной системы.
+
+
+### Примеры
+
+##### Примеры collaborative filtering
+
+###### **Наш придуманный пример**
+
+Что ему нравится:
+
+```{r message = FALSE, warning=FALSE}
+top10 = ratings %>% 
+  filter(user_id == '112548') %>% 
+  top_n(10, rating) %>% 
+  inner_join(metadata, by = "item_id")
+top10[,c(3,4)] %>% arrange(desc(rating)) %>% head(10)
+```
+Ему нравятся крайне специфичный набор фильмов, содержащий или детские фильмы (5й элемент) и всевозможные мультфильмы (Шрек, Ледниковый период), а также Интерстеллар и Диктатор (более взрослые фильмы)
+
+Теперь определим, что такому пользователю выведет наша система:
+
+```{r message = FALSE, warning=FALSE}
+func_old('112548', recc_predicted, metadata)
+```
+
+**Вывод:** Рекомендация оказалась хорошей: пользователь оценивал и фантастику и разные мультфильмы, и это же ему и порекомендовалось. Однако фильм Boondock Saints относится к жанру Crime/Action, что, скорее всего, не понравится пользователю
+
+###### **Пример из peer review**
+
+Вопрос: Если пользователю понравился фильм: Transformers (2007) Будет ли система рекомендовать посмотреть: Transformers: Dark of the Moon (2011)
+
+Найдем в датафрейме с оценками 
+```{r message = FALSE, warning=FALSE}
+film_id <- metadata %>% select(title, item_id)
+film_id <- merge(x = ratings, y = film_id, by = "item_id", all.x = TRUE)
+
+head(film_id[film_id$title == 'Transformers (2007)' & film_id$rating > 4,])
+```
+
+Таких пользователей оказалось много, выберем двух, оценивших данный фильм на 5: "916450" и "549430"
+
+Что нравится помимо Трансформеров первому пользователю:
+
+```{r message = FALSE, warning=FALSE}
+top10 = ratings %>% 
+  filter(user_id == '916450') %>% 
+  top_n(10, rating) %>% 
+  inner_join(metadata, by = "item_id")
+top10[,c(3,4)] %>% arrange(desc(rating)) %>% head(10)
+```
+
+Что ему порекомендовала User-Based система:
+
+```{r message = FALSE, warning=FALSE}
+func_old('916450', recc_predicted, metadata)
+```
+**Вывод:** Хотя пользователю нравятся разные мирные или роматические фентези, а также супергеройские фильмы и боевики, в качестве рекомендаций ему вывелись как раз эти самые романтические фильмы и боевики. Однако проблемой было то, что трансформеры были единичным случаем в его каталоге и именно поэтому ему не порекомендовались подобного рода супергеройские боевики
+
+Что нравится помимо Трансформеров второму пользователю:
+
+```{r message = FALSE, warning=FALSE}
+top10 = ratings %>% 
+  filter(user_id == '549430') %>% 
+  top_n(10, rating) %>% 
+  inner_join(metadata, by = "item_id")
+top10[,c(3,4)] %>% arrange(desc(rating)) %>% head(10)
+```
+Что ему порекомендовала User-Based система:
+
+```{r message = FALSE, warning=FALSE}
+func_old('549430', recc_predicted, metadata)
+```
+**Вывод:** Хотя пользователю нравились фэнтези и боевики, в рекомендациях не оказалось фильма Transformers: Dark of the Moon (2011), хотя он его еще не оценивал.
+
+##### Примеры content-based
+
+
+**Пример 1.** Получаем рекомендацию для пользователя 134
+
+Какие фильмы любит:
+```{r message = FALSE, warning=FALSE}
+user <- ratings %>% filter(user_id == 134	 & rating == 5)
+metadata %>% filter(item_id %in% user$item_id) %>% select(title, item_id)
+```
+
+
+Рекомендация:
+```{r message = FALSE, warning=FALSE}
+get_cb_recommendation(134,'Comedy')
+```
+
+
+*Комментарий к примеру 1:* Пользователю нравится романтика, комедия, научная фантастика и триллер. Система порекомендовала тоже романтические комедии - Правда о кошках и собаках, Старые ворчуны разбушевались, Девичник в Вегасе, Отпуск по обмену, Люблю тебя, чувак, Свадебный переполох; научную фантастику - Облачный атлас, Планета Ка-Пэкс и триллер - Неуязвимый. По характеристикам (год, возрастное ограничение, жанр, рейтинг) фильмы схожи тем, которым пользователь поставил оценку 5.
+
+
+
+**Пример 2.** Получаем рекомендацию для пользователя 49844
+
+Какие фильмы любит:
+```{r message = FALSE, warning=FALSE}
+user <- ratings %>% filter(user_id == 49844	 & rating == 5)
+metadata %>% filter(item_id %in% user$item_id) %>% select(title, item_id)
+```
+
+Рекомендация:
+```{r message = FALSE, warning=FALSE}
+get_cb_recommendation(49844, 'Romantic')
+```
+
+
+*Комментарий к примеру 2:* Пользователю порекомендовались другие части Матрицы, которая ему нравится. А также мультфильмы (В поисках Дори, Гадкий я 2, Холодное сердце, Тарзан, Похождения императора), так как ему понравился "Лило и Стич", и романтические комедии (Ларс и настоящая девушка, Любовь, сбивающая с ног) из-за того, что ему нравится "Игры разума" и "10 причин моей ненависти".
+
+
+
+**Пример 3.** Что выведется пользователю, которого нет в системе?
+
+Если пользователя нет в системе, то ему предлагается ввести любимый жанр и в качестве рекомендации выводятся самые высокооцененные фильмы в этом жанре.
+
+Для примера мы ввели жанр "Biography"
+
+Рекомендация:
+```{r message = FALSE, warning=FALSE}
+get_cb_recommendation(234234,'Biography')
+```
+
+
+*Комментарий к примеру 3:* Как и ожидалось, мы получили самые известные, высокооцененные фильмы в этом жанре, такие как "Список Шиндлера", "В центре внимания", "Бункер" и т.д.
+
+
+### Предложенный cценарий 
+
+**Порекомендуйте 5 фильмов пользователю, которому нравятся драмы и не нравятся триллеры, с помощью CF и CB. Похожи ли результаты? Почему?**
+
+Найдем таких пользователей
+
+Соединим информацию о фильмах с оценками пользователей
+```{r message = FALSE, warning=FALSE}
+film_id <- full %>% select(title, item_id, genre)
+film_id <- merge(x = ratings, y = film_id, by = "item_id", all.x = TRUE)
+```
+
+Обозначим "1", если фильм - драма в одной колонке, и также обозначим в другой колонке "1", если фильм - триллер. Оставим в датафрейме только эти фильмы
+```{r message = FALSE, warning=FALSE}
+pattern1 <- "Drama"
+pattern2 <- "Thriller"
+
+
+film_id$is_drama <- ifelse(grepl(pattern1, film_id$genre), 1, 0)
+film_id$is_thriller <- ifelse(grepl(pattern2, film_id$genre), 1, 0)
+
+film_id <- film_id %>% filter((is_drama == 1) | (is_thriller == 1))
+```
+
+Сгруппируем для каждого пользовтеля средние оценки в фильмах, где is_dramma = 1 и где is_thriller = 1 
+```{r message = FALSE, warning=FALSE}
+film_id <- film_id %>% group_by(user_id, is_drama, is_thriller) %>% summarise(avg_rating = mean(rating))
+
+head(film_id)
+```
+
+Теперь ищем того пользователя, у которого средний ретинг по драмам больше 4.5, а по триллерам меньше 2.5. Выделим в разные датафрейим и потом сделаем inner join по id
+
+```{r message = FALSE, warning=FALSE}
+dramas <- film_id %>% filter((is_drama == 1) & (avg_rating >= 4.5)) %>% select(user_id, avg_rating)
+trilers <- film_id %>% filter((is_thriller == 1) & (avg_rating <= 2.5)) %>% select(user_id, avg_rating)
+
+both <- merge(x=dramas,y=trilers, by="user_id")
+head(both)             
+```
+
+**Получили 42 пользователей, которые хорошо оценивали драмы и плохо оценивали триллеры**. Возьмем для рассмотрения один пример с пользователем "953040"
+
+Какие фильмы любит этот пользователь:
+```{r message = FALSE, warning=FALSE}
+user <- ratings %>% filter(user_id == 953040	 & rating == 5)
+metadata %>% filter(item_id %in% user$item_id) %>% select(title, item_id)
+```
+
+*Комментарий:* 
+На основании фильмов "L.A. Confidential", "Three Colors: Red" и "Quiz Show" можно сделать вывод о том, что пользователю нравятся кинематографические произведения, которые предлагают сложные сюжеты, интригующие загадки и глубокие моральные и этические дилеммы. Он интересуется фильмами, которые исследуют сложности человеческой природы, моральные проблемы, обман и коррупцию в различных областях жизни, таких как политика, развлекательная индустрия и общество в целом. Пользователь также проявляет интерес к биографическим драмам и историческим фильмам, которые основаны на реальных событиях и исследуют значимые периоды и личности истории.
+
+#### Что ему рекомендует СF система:
+
+CF рекомендация:
+```{r message = FALSE, warning=FALSE}
+func_old('953040', recc_predicted, metadata)
+```
+
+**Вывод:** Рекомендация вывела или sci-fi/action фильмы, или драмы - именно то, что нравится пользователю. Однако получилось одна неточность - фильм Run Lola Run (Lola rennt) (1998) по жанру являтся триллером, что не соответствует предпочтениям данного зрителя
+
+#### Что ему рекомендует СB система:
+
+CB рекомендация:
+```{r message = FALSE, warning=FALSE}
+get_cb_recommendation(953040,'Comedy')
+```
+
+
+Краткое описание фильмов, предложенных CB рекомендательной системой:
+
+1. "Prisoners" (2013) — фильм о двух семьях, чьи дети пропадают без вести, и отчаянной попытке отца одного из них найти их, погружаясь в мрачный и запутанный мир.
+
+2. "Milk" (2008) — биографическая драма, основанная на реальной истории жизни Харви Милка, первого открыто гея, избранного на публичную должность в Сан-Франциско, и его борьбе за гражданские права.
+
+3. "Lincoln" (2012) — историческая драма, которая охватывает последний год жизни президента США Авраама Линкольна и его усилия по принятию Декларации о прекращении рабства.
+
+4. "Three Colors: Blue" (Trois couleurs: Bleu) (1993) — первая часть трилогии Кристофа Киесловского, в которой синий цвет олицетворяет горе и освобождение. Фильм рассказывает историю женщины, потерявшей семью в автомобильной аварии.
+
+5. "Malcolm X" (1992) — биографическая драма о жизни и борьбе Малкольма Икса, известного афроамериканского активиста за гражданские права чернокожего населения.
+
+6. "The Hateful Eight" (2015) — фильм, в котором группа незнакомцев заперта в изолированной лавке из-за снежной бури, а внутри лавки разворачивается напряженная и опасная игра.
+
+7. "The Girl with the Dragon Tattoo" (2011) и "The Girl with the Dragon Tattoo" (Män som hatar kvinnor) (2009) — адаптации шведского романа, которые расследуют исчезновение девушки и погружаются в загадочные тайны и интриги.
+
+8. "Seven" (a.k.a. "Se7en") (1995) — фильм о двух детективах, которые охотятся на серийного убийцу, убивающего своих жертв в соответствии с семью смертными грехами.
+
+9. "Downfall" (Untergang, Der) — историческая драма, которая рассказывает о последних днях Адольфа Гитлера в бункере в Берлине во время Второй мировой войны.
+
+**Вывод:** СВ действительно предложила фильмы, которые могут понравиться данному пользователю, так эти фильмы предлагают сложные сюжеты, захватывающие истории и глубокие темы, что в его вкусе. Примечательно, что система не предлажила триллеры, которые он оценил низко.
+
+**Разница результатов СВ и CF для пользователя 953040**:
+
+Между СВ и CF рекомендательными системами есть разница. Они предлагают различные наборы фильмов. СВ система предложила фильмы, которые связаны с глубокими моральными и этическими дилеммами, исследованием человеческой природы, историческими событиями и сложными сюжетами. В то же время, CF система предложила фильмы с разнообразными жанрами, включая драму, комедию, научную фантастику и боевик, и обладающие своей уникальной особенностью и интересными сюжетами.
+
+**Почему результаты СВ и CF разные?**
+
+Рекомендации, сформулированные с использованием content-based подхода и коллаборативной фильтрации, отличаются из-за следующих факторов:
+
+1. Используемые данные:
+
+- В коллаборативной фильтрации используются оценки пользователей для различных фильмов. Модель строится на основе сходства между оценками пользователей и рекомендации делаются на основе этого сходства.
+
+- В content-based системе используются характеристики фильмов, такие как жанр, режиссеры, актеры и т.д. Модель строится на основе сходства между характеристиками фильмов, которые пользователь оценил на 5, и рекомендации делаются на основе этого сходства.
+
+2. Метод построения модели:
+
+- В коллаборативной фильтрации используется метод "UBCF" (User-Based Collaborative Filtering), который находит похожих пользователей на основе их оценок и предлагает фильмы, которые понравились этим похожим пользователям.
+
+- В content-based системе используется метод, основанный на вычислении сходства между фильмами на основе их характеристик. Затем для пользователя рекомендуются фильмы, которые имеют схожие характеристики с фильмами, которые пользователь оценил положительно.
+
+### Выводы
+
+**В результате проведенных текстового и сетевого анализов, построенных рекомендательных систем на основе коллаборативной фильтрации и content-based, мы пришли к следующим выводам:**
+
+
+* При использовании текстового и сетевого анализа фильмов было выяснено, что разделение на топики на основе сентимента в названиях фильмов не является эффективной идеей из-за отсутствия надежной интерпретации и недостоверности названий.
+
+* Разделение фильмов по жанрам оказалось наиболее четким и информативным. Однако, проблемой является потеря значительной части данных и сложность использования данной характеристики для принадлежности к сообществам.
+
+* Разделение по актерам и режиссерам также удалось, но возникли проблемы с большим количеством сообществ и недостаточным количеством данных для каждого актера и режиссера. Однако, эти характеристики могут быть полезны для уточнения результатов рекомендательной системы.
+
+* Также была создана content-based рекомендательная система, которая основывается на схожести фильмов на основе их признаков. Матрица схожести фильмов была вычислена на основе различных характеристик фильмов, таких как жанр, год выпуска и рейтинг. В зависимости от наличия идентификатора пользователя, система предоставляет рекомендации на основе оценок пользователя или предпочитаемого жанра. Для нового пользователя предлагается ввести любимый жанр и выводится 10 высокооценных фильмов в этом жанре.
